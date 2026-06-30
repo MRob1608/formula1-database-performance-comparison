@@ -1,1 +1,0 @@
-# formula1-database-performance-comparison
