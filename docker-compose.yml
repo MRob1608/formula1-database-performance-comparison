@@ -1,0 +1,41 @@
+services:
+  postgres:
+    image: postgres:16
+    container_name: f1_postgres
+    environment:
+      POSTGRES_DB: formula1
+      POSTGRES_USER: f1_user
+      POSTGRES_PASSWORD: f1_password
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U f1_user -d formula1"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  db_init:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: f1_postgres_init
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_NAME: formula1
+      DB_USER: f1_user
+      DB_PASSWORD: f1_password
+      DATA_DIR: /app/data/processed
+      RESET_DATABASE: "true"
+      LOAD_DATA: "true"
+    volumes:
+      - ./data/processed:/app/data/processed:ro
+    restart: "no"
+
+volumes:
+  postgres_data:
