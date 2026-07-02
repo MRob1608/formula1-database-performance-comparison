@@ -8,3 +8,4 @@ __pycache__/
 postgres_data/
 .env
 Reports/
+benchmark_results/
