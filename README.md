@@ -27,6 +27,34 @@ password: f1_password
 
 The initialization script is idempotent by default because `RESET_DATABASE=true` drops and recreates the Formula 1 tables each time `db_init` runs.
 
+## Neo4j with Docker
+
+Start Neo4j and load the graph model from the processed CSV files:
+
+```bash
+docker compose up --build neo4j neo4j_init
+```
+
+The compose stack contains:
+
+- `neo4j`: Neo4j 5 Community database container.
+- `neo4j_init`: Python container that creates graph constraints and imports `data/processed/*.csv`.
+
+Default Neo4j connection settings:
+
+```text
+browser: http://localhost:7474
+bolt: bolt://localhost:7687
+user: neo4j
+password: f1_password
+```
+
+The Neo4j graph follows the model documented in `Reports/neo4j_graph_model.md`. Stable entities such as seasons, races, circuits, drivers, constructors, and status values are modeled as nodes. Race facts such as results, qualifying, lap times, pit stops, and standings are modeled as relationships with properties.
+
+The import also creates graph-oriented structures for benchmark workloads: teammate links between drivers and `RaceLap` event nodes for lap-level analysis. These additions keep the source facts available while modeling domain relationships that would otherwise require repeated expensive self-joins or recursive traversals at query time.
+
+The initialization script is idempotent by default because `RESET_NEO4J_DATABASE=true` clears the existing graph before importing the processed CSV files.
+
 ## PostgreSQL Benchmark
 
 The benchmark is designed to run locally, outside Docker, while the PostgreSQL container is running. This keeps the database isolated in Docker but measures query execution from a normal client process.
@@ -53,20 +81,49 @@ Each query is measured in two ways:
 
 - Python wall-clock timing with `time.perf_counter()`.
 - PostgreSQL execution details with `EXPLAIN ANALYZE`.
+- Queries use a 10-minute statement timeout by default. Timed-out queries are recorded instead of stopping the benchmark.
+
+The previous SQL benchmark suite is archived as:
+
+```text
+sql/sql_queries_previous.sql
+```
+
+## Neo4j Benchmark
+
+Neo4j benchmark queries are stored in:
+
+```text
+neo4j/neo4j_queries.cypher
+```
+
+They are semantically paired with the PostgreSQL queries in `sql/sql_queries.sql`. The Neo4j benchmark records Python wall-clock timing and `PROFILE` output, which is the Neo4j equivalent of execution-plan analysis.
+
+Run all Neo4j benchmark queries:
+
+```bash
+venv\Scripts\python.exe src\benchmark_neo4j.py
+```
+
+Create a combined comparison report from the latest PostgreSQL and Neo4j JSON benchmark outputs:
+
+```bash
+venv\Scripts\python.exe src\benchmark_summary.py
+```
 
 ### Benchmark Queries
 
 `Q1_REL_YEARLY_WINNERS`
 
-Objective: retrieve the winner of every race from recent Formula 1 seasons, including the race year, round, Grand Prix name, winning driver, winning constructor, and winning time. This answers a common historical question: "Who won each recent race, and with which team?"
+Objective: retrieve every race winner in Formula 1 history, enrich each win with lap-time pace context from `lap_times`, and include cumulative career win numbers for both the driver and constructor. This keeps the query historically meaningful while forcing it to touch the largest table in the dataset.
 
-PostgreSQL implementation: joins `results`, `races`, `drivers`, and `constructors`, filters winner rows with `position_order = 1`, and orders by season and round. This favors the relational model because it is a direct indexed join over normalized tables.
+PostgreSQL implementation: joins `results`, `races`, `drivers`, and `constructors`, filters winner rows with `position_order = 1`, aggregates lap pace context from `lap_times`, and uses window functions to calculate cumulative win counters. Neo4j traverses `RESULT`, `DROVE_FOR`, and `LAP_TIME` relationships and derives equivalent counters from collected graph rows.
 
 `Q2_REL_CONSTRUCTOR_POINTS_BY_SEASON`
 
-Objective: calculate how many points each constructor scored in every season and rank constructors by seasonal performance. This answers questions such as "Which teams were strongest in each year?" and "How did constructor performance change over time?"
+Objective: rebuild constructor standings after every championship round by combining race and sprint points, calculating each constructor's running season total, and ranking teams at each round. This answers a more realistic standings question than a final season aggregate.
 
-PostgreSQL implementation: joins `results`, `races`, and `constructors`, then groups by season and constructor. This is a classic relational aggregation and should be a comfortable workload for PostgreSQL.
+PostgreSQL implementation: combines `results` and `sprint_results` with `UNION ALL`, groups by race round and constructor, then uses window functions for running season totals and per-round rankings. Neo4j traverses `DROVE_FOR` and `SPRINT_DROVE_FOR` relationships and performs equivalent grouping and ranking manually in Cypher.
 
 `Q3_REL_RACE_PACE_LAP_AGGREGATION`
 
@@ -74,26 +131,26 @@ Objective: compare each driver's average race pace per season by aggregating eve
 
 PostgreSQL implementation: scans `lap_times`, joins `races` and `drivers`, groups by season and driver, and computes average, best, and slowest lap times. This favors PostgreSQL because it is a large relational aggregate over the biggest table.
 
-`Q4_GRAPH_DRIVER_TEAMMATE_NETWORK`
+`Q4_MIXED_LAP_BATTLE_AGGREGATION`
 
-Objective: discover pairs of drivers who raced as teammates for the same constructor in the same races, then count how often each pairing occurred. This answers a network-style question: "Which driver pairings were the most frequent teammates?"
+Objective: find driver pairs who were closely matched on the same laps of the same race, using a maximum lap-time gap of 500 milliseconds. This identifies repeated race battles or closely matched pace patterns.
 
-PostgreSQL implementation: self-joins `results` on the same `race_id` and `constructor_id`, then joins driver and constructor metadata. This is a meaningful graph-style query because it asks for connections between drivers through shared teams and races.
+PostgreSQL implementation: self-joins `lap_times` on `(race_id, lap)`, filters pairs within 500 milliseconds, groups by race and driver pair, and ranks by repeated close laps. Neo4j implements the same logic through `RaceLap` nodes and `RECORDED_LAP` relationships.
 
-`Q5_GRAPH_DRIVER_SEPARATION`
+`Q5_GRAPH_TEAMMATE_SHORTEST_PATH`
 
-Objective: compute shortest teammate-network distances across all Formula 1 drivers and return the most distant connected driver pairs. Each graph edge means two drivers were teammates in the same race for the same constructor, so the query asks: "Which drivers are connected only through long chains of teammate relationships?"
+Objective: find the shortest teammate chain connecting Juan Manuel Fangio to Lando Norris, returning the full driver path. Each graph edge means two drivers were teammates for the same constructor in the same race.
 
-PostgreSQL implementation: derives teammate edges by self-joining `results`, starts a recursive breadth-first traversal from every driver, expands the teammate network up to depth eight, computes the minimum distance for every reachable driver pair, and returns the pairs with the largest shortest-path distances. This is intentionally graph-like because Neo4j can express the same task with shortest-path traversal over driver relationships.
+PostgreSQL implementation: reads the precomputed `teammate_edges` table created during database setup, then recursively searches acyclic paths while storing the full path. Neo4j traverses the materialized `TEAMMATE_WITH` relationship directly with `shortestPath`.
 
-`Q6_GRAPH_CONSTRUCTOR_CAREER_TRANSITIONS`
+`Q6_GRAPH_TEAMMATE_NEIGHBORHOOD_REACH`
 
-Objective: identify repeated career movement patterns between constructors by tracking each driver's constructor history and counting common team-to-team transitions. This answers questions such as "Which constructor moves happened most often across driver careers?"
+Objective: starting from Fernando Alonso, compute the shortest teammate-network distance to every distinct driver reachable within eight `TEAMMATE_WITH` hops. This is a neighborhood distance map, not a single target shortest path.
 
-PostgreSQL implementation: builds driver-constructor spells, uses window functions to find the next constructor in each driver's career, then aggregates repeated constructor-to-constructor transitions. In Neo4j, this is naturally modeled as paths from constructor to driver to next constructor.
+PostgreSQL implementation: recursively expands simple paths over the precomputed `teammate_edges` table, prevents cycles per branch, and deduplicates the nearest distance per reached driver. Neo4j runs shortest path expansion to many target drivers over native `TEAMMATE_WITH` adjacency.
 
-`Q7_GRAPH_LAP_BATTLE_NETWORK`
+`Q7_GRAPH_CONSTRUCTOR_DRIVER_BRIDGE`
 
-Objective: find driver pairs who were closely matched on the same lap of the same race, using a maximum lap-time gap of 500 milliseconds. This identifies on-track battles or closely matched pace patterns by comparing drivers lap-by-lap across the largest table in the dataset.
+Objective: find the shortest constructor-driver bridge connecting Christensen to Manor Marussia through drivers who raced for adjacent constructor links. This pair was chosen because it requires several alternating constructor and driver steps instead of a direct shared-driver bridge.
 
-PostgreSQL implementation: filters recent `lap_times`, self-joins the largest table on `(race_id, lap)`, checks lap-time gaps within 500 milliseconds, and aggregates close battles by driver pair and race. This is intentionally demanding for PostgreSQL and would map naturally to graph/event traversal if laps are modeled as race events in Neo4j.
+PostgreSQL implementation: reads the precomputed `driver_constructor_edges` table, then recursively alternates constructor and driver nodes while storing path names. Neo4j expresses the same traversal directly over `DROVE_FOR` relationships.

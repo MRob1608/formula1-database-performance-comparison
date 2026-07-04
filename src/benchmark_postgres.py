@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any
 
 import psycopg
+from psycopg import errors
 from psycopg.rows import dict_row
 
 
@@ -24,7 +25,7 @@ QUERY_PATTERN = re.compile(
     re.DOTALL,
 )
 QUERY_NAME_PATTERN = re.compile(r"^Q(?P<number>\d+)_")
-STATEMENT_TIMEOUT_MS = int(os.getenv("DB_STATEMENT_TIMEOUT_MS", "120000"))
+STATEMENT_TIMEOUT_MS = int(os.getenv("DB_STATEMENT_TIMEOUT_MS", "600000"))
 
 
 @dataclass(frozen=True)
@@ -90,12 +91,37 @@ def strip_sql_comments(sql_text: str) -> str:
 
 def run_query(cursor: psycopg.Cursor, query: BenchmarkQuery) -> dict[str, Any]:
     start = time.perf_counter()
-    cursor.execute(query.sql)
-    rows = cursor.fetchall()
-    elapsed_seconds = time.perf_counter() - start
+    try:
+        cursor.execute(query.sql)
+        rows = cursor.fetchall()
+    except errors.QueryCanceled as exc:
+        elapsed_seconds = time.perf_counter() - start
+        cursor.connection.rollback()
+        return {
+            "elapsed_seconds": elapsed_seconds,
+            "timed_out": True,
+            "failed": False,
+            "error": str(exc),
+            "row_count": None,
+            "sample_rows": [],
+        }
+    except psycopg.OperationalError as exc:
+        elapsed_seconds = time.perf_counter() - start
+        return {
+            "elapsed_seconds": elapsed_seconds,
+            "timed_out": False,
+            "failed": True,
+            "error": str(exc),
+            "row_count": None,
+            "sample_rows": [],
+        }
 
+    elapsed_seconds = time.perf_counter() - start
     return {
         "elapsed_seconds": elapsed_seconds,
+        "timed_out": False,
+        "failed": False,
+        "error": None,
         "row_count": len(rows),
         "sample_rows": rows[:10],
     }
@@ -116,28 +142,50 @@ def benchmark_queries(query_file: Path, output_dir: Path) -> tuple[Path, Path]:
 
     results = []
 
-    with connect() as connection:
-        with connection.cursor() as cursor:
-            cursor.execute("SELECT set_config('statement_timeout', %s, false)", (str(STATEMENT_TIMEOUT_MS),))
-            for query in queries:
-                print(f"Running {query.name}")
-                execution = run_query(cursor, query)
-                explain_plan = run_explain_analyze(cursor, query)
+    for query in queries:
+        print(f"Running {query.name}")
+        execution = None
+        explain_plan = []
+        try:
+            with connect() as connection:
+                with connection.cursor() as cursor:
+                    cursor.execute("SELECT set_config('statement_timeout', %s, false)", (str(STATEMENT_TIMEOUT_MS),))
+                    execution = run_query(cursor, query)
+                    if not execution["timed_out"] and not execution["failed"]:
+                        explain_plan = run_explain_analyze(cursor, query)
+        except psycopg.OperationalError as exc:
+            execution = {
+                "elapsed_seconds": 0,
+                "timed_out": False,
+                "failed": True,
+                "error": str(exc),
+                "row_count": None,
+                "sample_rows": [],
+            }
+            explain_plan = []
 
-                result = {
-                    "name": query.name,
-                    "sql": query.sql,
-                    "elapsed_seconds": execution["elapsed_seconds"],
-                    "row_count": execution["row_count"],
-                    "sample_rows": execution["sample_rows"],
-                    "explain_analyze": explain_plan,
-                }
-                results.append(result)
+        result = {
+            "name": query.name,
+            "sql": query.sql,
+            "elapsed_seconds": execution["elapsed_seconds"],
+            "timed_out": execution["timed_out"],
+            "failed": execution["failed"],
+            "error": execution["error"],
+            "row_count": execution["row_count"],
+            "sample_rows": execution["sample_rows"],
+            "explain_analyze": explain_plan,
+        }
+        results.append(result)
 
-                print(
-                    f"  rows={execution['row_count']} "
-                    f"python_time={execution['elapsed_seconds']:.6f}s"
-                )
+        if execution["timed_out"]:
+            print(f"  timed_out after {execution['elapsed_seconds']:.6f}s")
+        elif execution["failed"]:
+            print(f"  failed after {execution['elapsed_seconds']:.6f}s: {execution['error']}")
+        else:
+            print(
+                f"  rows={execution['row_count']} "
+                f"python_time={execution['elapsed_seconds']:.6f}s"
+            )
 
     payload = {
         "created_at": datetime.now().isoformat(timespec="seconds"),
@@ -179,9 +227,16 @@ def render_markdown_report(payload: dict[str, Any]) -> str:
     ]
 
     for result in payload["results"]:
-        lines.append(
-            f"| `{result['name']}` | {result['elapsed_seconds']:.6f} | {result['row_count']} |"
-        )
+        if result.get("timed_out"):
+            elapsed = f">{STATEMENT_TIMEOUT_MS / 1000:.0f}"
+            row_count = "timeout"
+        elif result.get("failed"):
+            elapsed = "failed"
+            row_count = "failed"
+        else:
+            elapsed = f"{result['elapsed_seconds']:.6f}"
+            row_count = result["row_count"]
+        lines.append(f"| `{result['name']}` | {elapsed} | {row_count} |")
 
     for result in payload["results"]:
         lines.extend(
@@ -204,7 +259,7 @@ def render_markdown_report(payload: dict[str, Any]) -> str:
                 "### EXPLAIN ANALYZE",
                 "",
                 "```text",
-                *result["explain_analyze"],
+                *(result["explain_analyze"] or [f"Skipped because the query did not complete: {result.get('error')}"]),
                 "```",
             ]
         )

@@ -325,11 +325,41 @@ INDEX_STATEMENTS = (
     "CREATE INDEX IF NOT EXISTS idx_results_race_id ON results (race_id);",
     "CREATE INDEX IF NOT EXISTS idx_results_driver_id ON results (driver_id);",
     "CREATE INDEX IF NOT EXISTS idx_results_constructor_id ON results (constructor_id);",
+    "CREATE INDEX IF NOT EXISTS idx_results_position_order ON results (position_order);",
     "CREATE INDEX IF NOT EXISTS idx_results_status_id ON results (status_id);",
     "CREATE INDEX IF NOT EXISTS idx_lap_times_driver_id ON lap_times (driver_id);",
+    "CREATE INDEX IF NOT EXISTS idx_lap_times_race_lap ON lap_times (race_id, lap);",
     "CREATE INDEX IF NOT EXISTS idx_pit_stops_driver_id ON pit_stops (driver_id);",
     "CREATE INDEX IF NOT EXISTS idx_driver_standings_driver_id ON driver_standings (driver_id);",
     "CREATE INDEX IF NOT EXISTS idx_constructor_standings_constructor_id ON constructor_standings (constructor_id);",
+)
+
+
+DERIVED_TABLE_STATEMENTS = (
+    """
+        CREATE TABLE IF NOT EXISTS teammate_edges (
+            driver_a_id integer NOT NULL REFERENCES drivers (driver_id),
+            driver_b_id integer NOT NULL REFERENCES drivers (driver_id),
+            shared_races integer NOT NULL CHECK (shared_races > 0),
+            PRIMARY KEY (driver_a_id, driver_b_id)
+        );
+    """,
+    """
+        CREATE TABLE IF NOT EXISTS driver_constructor_edges (
+            driver_id integer NOT NULL REFERENCES drivers (driver_id),
+            constructor_id integer NOT NULL REFERENCES constructors (constructor_id),
+            race_count integer NOT NULL CHECK (race_count > 0),
+            PRIMARY KEY (driver_id, constructor_id)
+        );
+    """,
+)
+
+
+DERIVED_INDEX_STATEMENTS = (
+    "CREATE INDEX IF NOT EXISTS idx_teammate_edges_driver_a ON teammate_edges (driver_a_id);",
+    "CREATE INDEX IF NOT EXISTS idx_teammate_edges_driver_b ON teammate_edges (driver_b_id);",
+    "CREATE INDEX IF NOT EXISTS idx_driver_constructor_edges_driver ON driver_constructor_edges (driver_id);",
+    "CREATE INDEX IF NOT EXISTS idx_driver_constructor_edges_constructor ON driver_constructor_edges (constructor_id);",
 )
 
 
@@ -344,6 +374,8 @@ def connect() -> psycopg.Connection:
 
 
 def drop_tables(cursor: psycopg.Cursor) -> None:
+    cursor.execute("DROP TABLE IF EXISTS teammate_edges CASCADE")
+    cursor.execute("DROP TABLE IF EXISTS driver_constructor_edges CASCADE")
     for table in reversed(TABLES):
         cursor.execute(sql.SQL("DROP TABLE IF EXISTS {} CASCADE").format(sql.Identifier(table.name)))
 
@@ -351,10 +383,14 @@ def drop_tables(cursor: psycopg.Cursor) -> None:
 def create_tables(cursor: psycopg.Cursor) -> None:
     for table in TABLES:
         cursor.execute(table.create_sql)
+    for statement in DERIVED_TABLE_STATEMENTS:
+        cursor.execute(statement)
 
 
 def create_indexes(cursor: psycopg.Cursor) -> None:
     for statement in INDEX_STATEMENTS:
+        cursor.execute(statement)
+    for statement in DERIVED_INDEX_STATEMENTS:
         cursor.execute(statement)
 
 
@@ -402,6 +438,54 @@ def load_data(cursor: psycopg.Cursor) -> None:
     for table in TABLES:
         row_count = load_table(cursor, table)
         print(f"Loaded {row_count} rows into {table.name}")
+    populate_derived_tables(cursor)
+
+
+def populate_derived_tables(cursor: psycopg.Cursor) -> None:
+    """Materialize graph-like edges outside benchmark timing for a fairer comparison."""
+    print("Building derived PostgreSQL edge tables")
+    cursor.execute("TRUNCATE TABLE teammate_edges, driver_constructor_edges")
+
+    # Each undirected Neo4j TEAMMATE_WITH relationship is stored as two directed
+    # SQL rows so recursive queries can follow indexed outgoing edges directly.
+    cursor.execute(
+        """
+        WITH pair_counts AS (
+            SELECT
+                LEAST(res_a.driver_id, res_b.driver_id) AS driver_a_id,
+                GREATEST(res_a.driver_id, res_b.driver_id) AS driver_b_id,
+                COUNT(*) AS shared_races
+            FROM results AS res_a
+            JOIN results AS res_b
+              ON res_b.race_id = res_a.race_id
+             AND res_b.constructor_id = res_a.constructor_id
+             AND res_b.driver_id > res_a.driver_id
+            GROUP BY
+                LEAST(res_a.driver_id, res_b.driver_id),
+                GREATEST(res_a.driver_id, res_b.driver_id)
+        )
+        INSERT INTO teammate_edges (driver_a_id, driver_b_id, shared_races)
+        SELECT driver_a_id, driver_b_id, shared_races FROM pair_counts
+        UNION ALL
+        SELECT driver_b_id, driver_a_id, shared_races FROM pair_counts
+        """
+    )
+
+    cursor.execute(
+        """
+        INSERT INTO driver_constructor_edges (driver_id, constructor_id, race_count)
+        SELECT driver_id, constructor_id, COUNT(*) AS race_count
+        FROM results
+        GROUP BY driver_id, constructor_id
+        """
+    )
+
+    cursor.execute("SELECT count(*) FROM teammate_edges")
+    teammate_edge_count = cursor.fetchone()[0]
+    cursor.execute("SELECT count(*) FROM driver_constructor_edges")
+    driver_constructor_edge_count = cursor.fetchone()[0]
+    print(f"Built {teammate_edge_count} teammate_edges rows")
+    print(f"Built {driver_constructor_edge_count} driver_constructor_edges rows")
 
 
 def main() -> None:

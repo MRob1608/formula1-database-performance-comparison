@@ -6,6 +6,9 @@ venv/
 __pycache__/
 *.pyc
 postgres_data/
+neo4j_data/
+neo4j_logs/
 .env
 Reports/
 benchmark_results/
+outputs/

@@ -1,35 +1,143 @@
+-- Changelog
+-- - Q1 now scans race winners plus lap_times pace context, forcing the query to use the largest table.
+-- - Q2 now builds round-by-round constructor standings from race and sprint points with window functions.
+-- - Q5 now reads precomputed teammate_edges instead of deriving teammate links inside the timed query.
+-- - Q6 now maps Alonso's teammate-network distance to all drivers reachable within eight hops.
+-- - Q7 now uses Christensen -> Manor Marussia, a longer constructor-driver bridge verified in Neo4j.
+
 -- Query Q1_REL_YEARLY_WINNERS
--- Objective: list race winners for recent seasons.
--- Expected profile: favorable to PostgreSQL because it is a selective relational join over indexed keys.
+-- Objective: retrieve every race winner in Formula 1 history, enrich each win with lap-time pace context from the largest table, and keep cumulative career win counters for both the driver and constructor.
+-- Expected profile: favorable to PostgreSQL because it combines indexed winner selection, a full lap_times aggregation, and analytic window counters in a tabular workload.
+WITH winners AS (
+    SELECT
+        r.race_id,
+        r.year,
+        r.round,
+        r.name AS race_name,
+        d.driver_id,
+        d.forename || ' ' || d.surname AS winner,
+        c.constructor_id,
+        c.name AS constructor,
+        res.time AS winning_time
+    FROM results AS res
+    JOIN races AS r ON r.race_id = res.race_id
+    JOIN drivers AS d ON d.driver_id = res.driver_id
+    JOIN constructors AS c ON c.constructor_id = res.constructor_id
+    WHERE res.position_order = 1
+),
+lap_context AS (
+    SELECT
+        winners.race_id,
+        winners.driver_id,
+        COUNT(lt.milliseconds) AS race_lap_records,
+        COUNT(lt.milliseconds) FILTER (WHERE lt.driver_id = winners.driver_id) AS winner_laps_recorded,
+        ROUND(AVG(lt.milliseconds) FILTER (WHERE lt.driver_id = winners.driver_id)::numeric, 2) AS winner_avg_lap_ms,
+        MIN(lt.milliseconds) FILTER (WHERE lt.driver_id = winners.driver_id) AS winner_best_lap_ms,
+        ROUND(AVG(lt.milliseconds)::numeric, 2) AS race_avg_lap_ms
+    FROM winners
+    LEFT JOIN lap_times AS lt ON lt.race_id = winners.race_id
+    GROUP BY winners.race_id, winners.driver_id
+)
 SELECT
-    r.year,
-    r.round,
-    r.name AS race_name,
-    d.forename || ' ' || d.surname AS winner,
-    c.name AS constructor,
-    res.time AS winning_time
-FROM results AS res
-JOIN races AS r ON r.race_id = res.race_id
-JOIN drivers AS d ON d.driver_id = res.driver_id
-JOIN constructors AS c ON c.constructor_id = res.constructor_id
-WHERE res.position_order = 1
-  AND r.year >= 2020
-ORDER BY r.year DESC, r.round DESC;
+    winners.year,
+    winners.round,
+    winners.race_name,
+    winners.winner,
+    winners.constructor,
+    winners.winning_time,
+    lap_context.winner_laps_recorded,
+    lap_context.winner_avg_lap_ms,
+    lap_context.winner_best_lap_ms,
+    lap_context.race_avg_lap_ms,
+    lap_context.race_lap_records,
+    COUNT(*) OVER (
+        PARTITION BY winners.driver_id
+        ORDER BY winners.year, winners.round
+        ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+    ) AS driver_career_win_number,
+    COUNT(*) OVER (
+        PARTITION BY winners.constructor_id
+        ORDER BY winners.year, winners.round
+        ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+    ) AS constructor_career_win_number
+FROM winners
+JOIN lap_context ON lap_context.race_id = winners.race_id
+                AND lap_context.driver_id = winners.driver_id
+ORDER BY winners.year DESC, winners.round DESC;
 
 -- Query Q2_REL_CONSTRUCTOR_POINTS_BY_SEASON
--- Objective: aggregate constructor points by season.
--- Expected profile: favorable to PostgreSQL because it is a classic GROUP BY aggregate.
+-- Objective: rebuild the constructor standings after every championship round by combining race and sprint points, calculating each constructor's running season total, and ranking teams at each round.
+-- Expected profile: favorable to PostgreSQL because it combines UNION ALL, GROUP BY, running SUM windows, and per-round ranking over normalized result tables.
+WITH scoring_events AS (
+    SELECT
+        r.year,
+        r.round,
+        r.race_id,
+        r.name AS race_name,
+        res.constructor_id,
+        res.points,
+        'race' AS event_type
+    FROM results AS res
+    JOIN races AS r ON r.race_id = res.race_id
+    UNION ALL
+    SELECT
+        r.year,
+        r.round,
+        r.race_id,
+        r.name AS race_name,
+        sprint.constructor_id,
+        sprint.points,
+        'sprint' AS event_type
+    FROM sprint_results AS sprint
+    JOIN races AS r ON r.race_id = sprint.race_id
+),
+constructor_round_points AS (
+    SELECT
+        event.year,
+        event.round,
+        event.race_id,
+        event.race_name,
+        c.constructor_id,
+        c.name AS constructor,
+        SUM(event.points) AS round_points,
+        COUNT(*) AS classified_results,
+        COUNT(*) FILTER (WHERE event.event_type = 'sprint') AS sprint_results
+    FROM scoring_events AS event
+    JOIN constructors AS c ON c.constructor_id = event.constructor_id
+    GROUP BY event.year, event.round, event.race_id, event.race_name, c.constructor_id, c.name
+),
+running_points AS (
+    SELECT
+        *,
+        SUM(round_points) OVER (
+            PARTITION BY year, constructor_id
+            ORDER BY round
+            ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+        ) AS season_points_to_date
+    FROM constructor_round_points
+),
+ranked_points AS (
+    SELECT
+        *,
+        RANK() OVER (
+            PARTITION BY year, round
+            ORDER BY season_points_to_date DESC, constructor ASC
+        ) AS season_rank_after_round
+    FROM running_points
+)
 SELECT
-    r.year,
-    c.name AS constructor,
-    SUM(res.points) AS total_points,
-    COUNT(*) AS classified_results
-FROM results AS res
-JOIN races AS r ON r.race_id = res.race_id
-JOIN constructors AS c ON c.constructor_id = res.constructor_id
-GROUP BY r.year, c.constructor_id, c.name
-HAVING SUM(res.points) > 0
-ORDER BY r.year DESC, total_points DESC;
+    year,
+    round,
+    race_name,
+    constructor,
+    round_points,
+    season_points_to_date,
+    season_rank_after_round,
+    classified_results,
+    sprint_results
+FROM ranked_points
+WHERE season_points_to_date > 0
+ORDER BY year DESC, round DESC, season_rank_after_round ASC;
 
 -- Query Q3_REL_RACE_PACE_LAP_AGGREGATION
 -- Objective: compare average lap pace by driver and season across all recorded laps.
@@ -45,170 +153,28 @@ FROM lap_times AS lt
 JOIN races AS r ON r.race_id = lt.race_id
 JOIN drivers AS d ON d.driver_id = lt.driver_id
 GROUP BY r.year, d.driver_id, d.forename, d.surname
---HAVING COUNT(*) >= 100
-ORDER BY r.year DESC, avg_lap_ms ASC
---LIMIT 100;
+ORDER BY r.year DESC, avg_lap_ms ASC;
 
--- Query Q4_GRAPH_DRIVER_TEAMMATE_NETWORK
--- Objective: find driver pairs who were teammates and count shared races.
--- Expected profile: favorable to graph databases because it is naturally a relationship/path query between drivers through constructors and races.
-SELECT
-    d1.forename || ' ' || d1.surname AS driver_a,
-    d2.forename || ' ' || d2.surname AS driver_b,
-    c.name AS constructor,
-    COUNT(DISTINCT res1.race_id) AS shared_races
-FROM results AS res1
-JOIN results AS res2
-  ON res2.race_id = res1.race_id
- AND res2.constructor_id = res1.constructor_id
- AND res2.driver_id > res1.driver_id
-JOIN drivers AS d1 ON d1.driver_id = res1.driver_id
-JOIN drivers AS d2 ON d2.driver_id = res2.driver_id
-JOIN constructors AS c ON c.constructor_id = res1.constructor_id
-GROUP BY d1.driver_id, d1.forename, d1.surname, d2.driver_id, d2.forename, d2.surname, c.constructor_id, c.name
-HAVING COUNT(DISTINCT res1.race_id) >= 20
-ORDER BY shared_races DESC, constructor
-LIMIT 50;
-
--- Query Q5_GRAPH_DRIVER_SEPARATION
--- Objective: compute shortest teammate-network distances across all Formula 1 drivers and return the most distant connected driver pairs.
--- Expected profile: favorable to graph databases because shortest path expansion is native in Neo4j but requires recursive breadth-first traversal over a derived edge table in PostgreSQL.
-WITH RECURSIVE teammate_edges AS MATERIALIZED (
-    SELECT DISTINCT
-        res1.driver_id AS from_driver_id,
-        res2.driver_id AS to_driver_id
-    FROM results AS res1
-    JOIN results AS res2
-      ON res2.race_id = res1.race_id
-     AND res2.constructor_id = res1.constructor_id
-     AND res2.driver_id <> res1.driver_id
-),
-eligible_drivers AS MATERIALIZED (
-    SELECT DISTINCT driver_id
-    FROM results
-),
-search AS (
+-- Query Q4_MIXED_LAP_BATTLE_AGGREGATION
+-- Objective: find driver pairs who were closely matched on the same laps of the same race.
+-- Expected profile: intermediate because both databases must aggregate many lap-level events.
+WITH close_lap_pairs AS (
     SELECT
-        driver_id AS start_driver_id,
-        driver_id AS current_driver_id,
-        0 AS depth
-    FROM eligible_drivers
-    UNION
-    SELECT
-        search.start_driver_id,
-        edge.to_driver_id AS current_driver_id,
-        search.depth + 1 AS depth
-    FROM search
-    JOIN teammate_edges AS edge ON edge.from_driver_id = search.current_driver_id
-    WHERE search.depth < 8
-),
-shortest_distances AS (
-    SELECT
-        start_driver_id,
-        current_driver_id AS target_driver_id,
-        MIN(depth) AS shortest_distance
-    FROM search
-    WHERE depth > 0
-    GROUP BY start_driver_id, current_driver_id
-)
-SELECT
-    start_driver.forename || ' ' || start_driver.surname AS start_driver,
-    target_driver.forename || ' ' || target_driver.surname AS target_driver,
-    shortest_distance
-FROM shortest_distances AS sd
-JOIN drivers AS start_driver ON start_driver.driver_id = sd.start_driver_id
-JOIN drivers AS target_driver ON target_driver.driver_id = sd.target_driver_id
-WHERE shortest_distance >= 6
-ORDER BY shortest_distance DESC, start_driver, target_driver
-LIMIT 100;
-
--- Query Q6_GRAPH_CONSTRUCTOR_CAREER_TRANSITIONS
--- Objective: identify common driver career transitions between constructors across consecutive constructor spells.
--- Expected profile: favorable to graph databases because constructor-to-constructor movement is naturally represented as paths through drivers.
-WITH driver_constructor_years AS (
-    SELECT
-        res.driver_id,
-        res.constructor_id,
-        MIN(r.year) AS first_year,
-        MAX(r.year) AS last_year,
-        COUNT(DISTINCT res.race_id) AS races_with_constructor
-    FROM results AS res
-    JOIN races AS r ON r.race_id = res.race_id
-    GROUP BY res.driver_id, res.constructor_id
-),
-ordered_constructor_spells AS (
-    SELECT
-        dcy.*,
-        LEAD(dcy.constructor_id) OVER (
-            PARTITION BY dcy.driver_id
-            ORDER BY dcy.first_year, dcy.last_year, dcy.constructor_id
-        ) AS next_constructor_id,
-        LEAD(dcy.first_year) OVER (
-            PARTITION BY dcy.driver_id
-            ORDER BY dcy.first_year, dcy.last_year, dcy.constructor_id
-        ) AS next_first_year
-    FROM driver_constructor_years AS dcy
-),
-career_transitions AS (
-    SELECT
-        driver_id,
-        constructor_id AS from_constructor_id,
-        next_constructor_id AS to_constructor_id,
-        first_year,
-        last_year,
-        next_first_year
-    FROM ordered_constructor_spells
-    WHERE next_constructor_id IS NOT NULL
-      AND next_constructor_id <> constructor_id
-)
-SELECT
-    from_constructor.name AS from_constructor,
-    to_constructor.name AS to_constructor,
-    COUNT(DISTINCT ct.driver_id) AS driver_count,
-    MIN(ct.first_year) AS earliest_from_year,
-    MAX(ct.next_first_year) AS latest_to_year,
-    STRING_AGG(DISTINCT driver.forename || ' ' || driver.surname, ', ' ORDER BY driver.forename || ' ' || driver.surname) AS example_drivers
-FROM career_transitions AS ct
-JOIN constructors AS from_constructor ON from_constructor.constructor_id = ct.from_constructor_id
-JOIN constructors AS to_constructor ON to_constructor.constructor_id = ct.to_constructor_id
-JOIN drivers AS driver ON driver.driver_id = ct.driver_id
-GROUP BY from_constructor.constructor_id, from_constructor.name, to_constructor.constructor_id, to_constructor.name
-HAVING COUNT(DISTINCT ct.driver_id) >= 2
-ORDER BY driver_count DESC, from_constructor, to_constructor
-LIMIT 50;
-
--- Query Q7_GRAPH_LAP_BATTLE_NETWORK
--- Objective: find driver pairs who were closely matched on the same laps in recent races.
--- Expected profile: favorable to graph databases when modeled with Race/Lap event relationships; PostgreSQL must self-join the largest table by race and lap.
-WITH recent_laps AS (
-    SELECT
-        lt.race_id,
         r.year,
+        lt_a.race_id,
         r.name AS race_name,
-        lt.lap,
-        lt.driver_id,
-        lt.position,
-        lt.milliseconds
-    FROM lap_times AS lt
-    JOIN races AS r ON r.race_id = lt.race_id
-    -- WHERE r.year >= 2020
-),
-close_lap_pairs AS (
-    SELECT
-        lap_a.year,
-        lap_a.race_id,
-        lap_a.race_name,
-        lap_a.driver_id AS driver_a_id,
-        lap_b.driver_id AS driver_b_id,
+        lt_a.driver_id AS driver_a_id,
+        lt_b.driver_id AS driver_b_id,
         COUNT(*) AS close_laps,
-        ROUND(AVG(ABS(lap_a.milliseconds - lap_b.milliseconds))::numeric, 2) AS avg_gap_ms
-    FROM recent_laps AS lap_a
-    JOIN recent_laps AS lap_b
-      ON lap_b.race_id = lap_a.race_id
-     AND lap_b.lap = lap_a.lap
-     AND lap_b.driver_id > lap_a.driver_id
-     AND ABS(lap_a.milliseconds - lap_b.milliseconds) <= 500
-    GROUP BY lap_a.year, lap_a.race_id, lap_a.race_name, lap_a.driver_id, lap_b.driver_id
+        ROUND(AVG(ABS(lt_a.milliseconds - lt_b.milliseconds))::numeric, 2) AS avg_gap_ms
+    FROM lap_times AS lt_a
+    JOIN lap_times AS lt_b
+      ON lt_b.race_id = lt_a.race_id
+     AND lt_b.lap = lt_a.lap
+     AND lt_b.driver_id > lt_a.driver_id
+     AND ABS(lt_a.milliseconds - lt_b.milliseconds) <= 500
+    JOIN races AS r ON r.race_id = lt_a.race_id
+    GROUP BY r.year, lt_a.race_id, r.name, lt_a.driver_id, lt_b.driver_id
     HAVING COUNT(*) >= 10
 )
 SELECT
@@ -223,3 +189,165 @@ JOIN drivers AS driver_a ON driver_a.driver_id = clp.driver_a_id
 JOIN drivers AS driver_b ON driver_b.driver_id = clp.driver_b_id
 ORDER BY clp.close_laps DESC, clp.avg_gap_ms ASC
 LIMIT 100;
+
+-- Query Q5_GRAPH_TEAMMATE_SHORTEST_PATH
+-- Objective: find the shortest teammate chain connecting Juan Manuel Fangio to Lando Norris, returning the full driver sequence where each hop means the two adjacent drivers were teammates in at least one race.
+-- Expected profile: strongly favorable to Neo4j because PostgreSQL now uses precomputed edges for fairness, but still has to perform recursive joins and branch-local cycle checks instead of index-free graph adjacency traversal.
+WITH RECURSIVE selected_drivers AS MATERIALIZED (
+    SELECT
+        MAX(driver_id) FILTER (WHERE forename = 'Juan' AND surname = 'Fangio') AS start_driver_id,
+        MAX(driver_id) FILTER (WHERE forename = 'Lando' AND surname = 'Norris') AS target_driver_id
+    FROM drivers
+),
+search AS (
+    SELECT
+        selected_drivers.start_driver_id AS current_driver_id,
+        ARRAY[selected_drivers.start_driver_id] AS path,
+        '|' || selected_drivers.start_driver_id::text || '|' AS visited_key,
+        0 AS depth
+    FROM selected_drivers
+    UNION ALL
+    SELECT
+        edge.driver_b_id AS current_driver_id,
+        search.path || edge.driver_b_id,
+        search.visited_key || edge.driver_b_id::text || '|',
+        search.depth + 1 AS depth
+    FROM search
+    JOIN teammate_edges AS edge ON edge.driver_a_id = search.current_driver_id
+    CROSS JOIN selected_drivers
+    WHERE search.depth < 8
+      AND POSITION('|' || edge.driver_b_id::text || '|' IN search.visited_key) = 0
+      AND search.current_driver_id <> selected_drivers.target_driver_id
+),
+shortest_path AS (
+    SELECT search.path, search.depth
+    FROM search
+    CROSS JOIN selected_drivers
+    WHERE search.current_driver_id = selected_drivers.target_driver_id
+    ORDER BY search.depth
+    LIMIT 1
+)
+SELECT
+    shortest_path.depth AS teammate_hops,
+    STRING_AGG(driver.forename || ' ' || driver.surname, ' -> ' ORDER BY path_nodes.ordinality) AS teammate_chain
+FROM shortest_path
+CROSS JOIN LATERAL UNNEST(shortest_path.path) WITH ORDINALITY AS path_nodes(driver_id, ordinality)
+JOIN drivers AS driver ON driver.driver_id = path_nodes.driver_id
+GROUP BY shortest_path.depth;
+
+-- Query Q6_GRAPH_TEAMMATE_NEIGHBORHOOD_REACH
+-- Objective: starting from Fernando Alonso, compute the shortest teammate-network distance to every distinct driver reachable within eight hops, producing a neighborhood distance map instead of a single target path.
+-- Expected profile: favorable to Neo4j because it can run shortest path expansion against many targets over native adjacency, while PostgreSQL recursively expands simple paths and then deduplicates the nearest distance per reached driver.
+WITH RECURSIVE selected_driver AS MATERIALIZED (
+    SELECT driver_id AS start_driver_id
+    FROM drivers
+    WHERE driver_ref = 'alonso'
+),
+paths AS (
+    SELECT
+        selected_driver.start_driver_id AS current_driver_id,
+        ARRAY[selected_driver.start_driver_id] AS path,
+        '|' || selected_driver.start_driver_id::text || '|' AS visited_key,
+        0 AS depth
+    FROM selected_driver
+    UNION ALL
+    SELECT
+        edge.driver_b_id AS current_driver_id,
+        paths.path || edge.driver_b_id,
+        paths.visited_key || edge.driver_b_id::text || '|',
+        paths.depth + 1 AS depth
+    FROM paths
+    JOIN teammate_edges AS edge ON edge.driver_a_id = paths.current_driver_id
+    CROSS JOIN selected_driver
+    WHERE paths.depth < 8
+      AND POSITION('|' || edge.driver_b_id::text || '|' IN paths.visited_key) = 0
+      AND edge.driver_b_id <> selected_driver.start_driver_id
+),
+shortest_reach AS (
+    SELECT
+        current_driver_id,
+        MIN(depth) AS min_hops
+    FROM paths
+    CROSS JOIN selected_driver
+    WHERE current_driver_id <> selected_driver.start_driver_id
+    GROUP BY current_driver_id
+),
+named_reach AS (
+    SELECT
+        reached.min_hops,
+        driver.forename || ' ' || driver.surname AS driver_name
+    FROM shortest_reach AS reached
+    JOIN drivers AS driver ON driver.driver_id = reached.current_driver_id
+)
+SELECT
+    COUNT(*) AS reachable_driver_count,
+    MIN(min_hops) AS nearest_hops,
+    MAX(min_hops) AS farthest_hops,
+    ROUND(AVG(min_hops)::numeric, 2) AS avg_hops,
+    ARRAY_TO_STRING((ARRAY_AGG(driver_name ORDER BY min_hops, driver_name))[1:25], ' | ') AS sample_reachable_drivers
+FROM named_reach;
+
+-- Query Q7_GRAPH_CONSTRUCTOR_DRIVER_BRIDGE
+-- Objective: find the shortest constructor-driver bridge connecting Christensen to Manor Marussia, two constructors without a direct shared-driver bridge, so the result must traverse several alternating constructor and driver steps across eras.
+-- Expected profile: favorable to Neo4j because this is a bipartite graph traversal; PostgreSQL uses a precomputed edge table, but recursive SQL still alternates node types through joins and branch-local cycle checks.
+WITH RECURSIVE selected_constructors AS MATERIALIZED (
+    SELECT
+        MAX(constructor_id) FILTER (WHERE constructor_ref = 'vhristensen') AS start_constructor_id,
+        MAX(constructor_id) FILTER (WHERE constructor_ref = 'manor') AS target_constructor_id
+    FROM constructors
+),
+search AS (
+    SELECT
+        'constructor'::text AS current_type,
+        selected_constructors.start_constructor_id AS current_id,
+        '|constructor:' || selected_constructors.start_constructor_id::text || '|' AS visited_key,
+        ARRAY[(SELECT name FROM constructors WHERE constructor_id = selected_constructors.start_constructor_id)] AS path_names,
+        0 AS depth
+    FROM selected_constructors
+    UNION ALL
+    SELECT
+        next_step.next_type AS current_type,
+        next_step.next_id AS current_id,
+        search.visited_key || next_step.next_key || '|',
+        search.path_names || next_step.next_name,
+        search.depth + 1 AS depth
+    FROM search
+    JOIN driver_constructor_edges AS edge
+      ON (search.current_type = 'constructor' AND edge.constructor_id = search.current_id)
+      OR (search.current_type = 'driver' AND edge.driver_id = search.current_id)
+    LEFT JOIN drivers AS driver
+      ON search.current_type = 'constructor'
+     AND driver.driver_id = edge.driver_id
+    LEFT JOIN constructors AS constructor
+      ON search.current_type = 'driver'
+     AND constructor.constructor_id = edge.constructor_id
+    CROSS JOIN LATERAL (
+        SELECT
+            CASE WHEN search.current_type = 'constructor' THEN 'driver' ELSE 'constructor' END AS next_type,
+            CASE WHEN search.current_type = 'constructor' THEN edge.driver_id ELSE edge.constructor_id END AS next_id,
+            CASE
+                WHEN search.current_type = 'constructor' THEN 'driver:' || edge.driver_id::text
+                ELSE 'constructor:' || edge.constructor_id::text
+            END AS next_key,
+            CASE
+                WHEN search.current_type = 'constructor' THEN driver.forename || ' ' || driver.surname
+                ELSE constructor.name
+            END AS next_name
+    ) AS next_step
+    WHERE search.depth < 10
+      AND POSITION('|' || next_step.next_key || '|' IN search.visited_key) = 0
+),
+shortest_path AS (
+    SELECT search.depth, search.path_names
+    FROM search
+    CROSS JOIN selected_constructors
+    WHERE search.current_type = 'constructor'
+      AND search.current_id = selected_constructors.target_constructor_id
+      AND search.depth > 0
+    ORDER BY search.depth
+    LIMIT 1
+)
+SELECT
+    shortest_path.depth AS relationship_hops,
+    ARRAY_TO_STRING(shortest_path.path_names, ' -> ') AS constructor_driver_chain
+FROM shortest_path;
