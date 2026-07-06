@@ -1,13 +1,6 @@
--- Changelog
--- - Q1 now scans race winners plus lap_times pace context, forcing the query to use the largest table.
--- - Q2 now builds round-by-round constructor standings from race and sprint points with window functions.
--- - Q5 now reads precomputed teammate_edges instead of deriving teammate links inside the timed query.
--- - Q6 now maps Alonso's teammate-network distance to all drivers reachable within eight hops.
--- - Q7 now uses Christensen -> Manor Marussia, a longer constructor-driver bridge verified in Neo4j.
 
 -- Query Q1_REL_YEARLY_WINNERS
 -- Objective: retrieve every race winner in Formula 1 history, enrich each win with lap-time pace context from the largest table, and keep cumulative career win counters for both the driver and constructor.
--- Expected profile: favorable to PostgreSQL because it combines indexed winner selection, a full lap_times aggregation, and analytic window counters in a tabular workload.
 WITH winners AS (
     SELECT
         r.race_id,
@@ -67,7 +60,6 @@ ORDER BY winners.year DESC, winners.round DESC;
 
 -- Query Q2_REL_CONSTRUCTOR_POINTS_BY_SEASON
 -- Objective: rebuild the constructor standings after every championship round by combining race and sprint points, calculating each constructor's running season total, and ranking teams at each round.
--- Expected profile: favorable to PostgreSQL because it combines UNION ALL, GROUP BY, running SUM windows, and per-round ranking over normalized result tables.
 WITH scoring_events AS (
     SELECT
         r.year,
@@ -141,7 +133,6 @@ ORDER BY year DESC, round DESC, season_rank_after_round ASC;
 
 -- Query Q3_REL_RACE_PACE_LAP_AGGREGATION
 -- Objective: compare average lap pace by driver and season across all recorded laps.
--- Expected profile: favorable to PostgreSQL because it scans and aggregates the largest table with relational joins.
 SELECT
     r.year,
     d.forename || ' ' || d.surname AS driver,
@@ -157,7 +148,6 @@ ORDER BY r.year DESC, avg_lap_ms ASC;
 
 -- Query Q4_MIXED_LAP_BATTLE_AGGREGATION
 -- Objective: find driver pairs who were closely matched on the same laps of the same race.
--- Expected profile: intermediate because both databases must aggregate many lap-level events.
 WITH close_lap_pairs AS (
     SELECT
         r.year,
@@ -192,7 +182,6 @@ LIMIT 100;
 
 -- Query Q5_GRAPH_TEAMMATE_SHORTEST_PATH
 -- Objective: find the shortest teammate chain connecting Juan Manuel Fangio to Lando Norris, returning the full driver sequence where each hop means the two adjacent drivers were teammates in at least one race.
--- Expected profile: strongly favorable to Neo4j because PostgreSQL now uses precomputed edges for fairness, but still has to perform recursive joins and branch-local cycle checks instead of index-free graph adjacency traversal.
 WITH RECURSIVE selected_drivers AS MATERIALIZED (
     SELECT
         MAX(driver_id) FILTER (WHERE forename = 'Juan' AND surname = 'Fangio') AS start_driver_id,
@@ -237,7 +226,6 @@ GROUP BY shortest_path.depth;
 
 -- Query Q6_GRAPH_TEAMMATE_NEIGHBORHOOD_REACH
 -- Objective: starting from Fernando Alonso, compute the shortest teammate-network distance to every distinct driver reachable within eight hops, producing a neighborhood distance map instead of a single target path.
--- Expected profile: favorable to Neo4j because it can run shortest path expansion against many targets over native adjacency, while PostgreSQL recursively expands simple paths and then deduplicates the nearest distance per reached driver.
 WITH RECURSIVE selected_driver AS MATERIALIZED (
     SELECT driver_id AS start_driver_id
     FROM drivers
@@ -289,7 +277,6 @@ FROM named_reach;
 
 -- Query Q7_GRAPH_CONSTRUCTOR_DRIVER_BRIDGE
 -- Objective: find the shortest constructor-driver bridge connecting Christensen to Manor Marussia, two constructors without a direct shared-driver bridge, so the result must traverse several alternating constructor and driver steps across eras.
--- Expected profile: favorable to Neo4j because this is a bipartite graph traversal; PostgreSQL uses a precomputed edge table, but recursive SQL still alternates node types through joins and branch-local cycle checks.
 WITH RECURSIVE selected_constructors AS MATERIALIZED (
     SELECT
         MAX(constructor_id) FILTER (WHERE constructor_ref = 'vhristensen') AS start_constructor_id,

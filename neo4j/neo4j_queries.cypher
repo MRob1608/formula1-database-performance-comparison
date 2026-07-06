@@ -1,13 +1,6 @@
-// Changelog
-// - Q1 now scans race winners plus lap_times pace context, forcing the query to use the largest table.
-// - Q2 now builds round-by-round constructor standings from race and sprint points.
-// - Q1 and Q2 now use DROVE_FOR / SPRINT_DROVE_FOR traversals instead of Constructor property lookups.
-// - Q6 now maps Alonso's teammate-network distance to all drivers reachable within eight hops.
-// - Q7 now uses Christensen -> Manor Marussia, a longer constructor-driver bridge verified in Neo4j.
 
 // Query Q1_REL_YEARLY_WINNERS
 // Objective: retrieve every race winner in Formula 1 history, enrich each win with lap-time pace context from the largest table, and keep cumulative career win counters for both the driver and constructor.
-// Expected profile: favorable to PostgreSQL because Cypher must traverse lap-time relationships and derive analytic counters from collected graph rows.
 MATCH (driver:Driver)-[result:RESULT]->(race:Race)
 MATCH (driver)-[drive:DROVE_FOR]->(constructor:Constructor)
 WHERE result.position_order = 1
@@ -65,7 +58,6 @@ ORDER BY year DESC, round DESC;
 
 // Query Q2_REL_CONSTRUCTOR_POINTS_BY_SEASON
 // Objective: rebuild the constructor standings after every championship round by combining race and sprint points, calculating each constructor's running season total, and ranking teams at each round.
-// Expected profile: favorable to PostgreSQL because the workload is a tabular UNION-style aggregate with running totals and per-round ranking, while Cypher must assemble and rank grouped graph rows manually.
 CALL {
     MATCH (driver:Driver)-[result:RESULT]->(race:Race)
     MATCH (driver)-[drive:DROVE_FOR]->(constructor:Constructor)
@@ -148,7 +140,6 @@ ORDER BY year DESC, round DESC, season_rank_after_round ASC;
 
 // Query Q3_REL_RACE_PACE_LAP_AGGREGATION
 // Objective: compare average lap pace by driver and season across all recorded laps.
-// Expected profile: favorable to PostgreSQL because it scans and aggregates the largest table with relational joins.
 MATCH (driver:Driver)-[lap_time:LAP_TIME]->(race:Race)
 WITH
     race.year AS year,
@@ -168,7 +159,6 @@ ORDER BY year DESC, avg_lap_ms ASC;
 
 // Query Q4_MIXED_LAP_BATTLE_AGGREGATION
 // Objective: find driver pairs who were closely matched on the same laps of the same race.
-// Expected profile: intermediate because both databases must aggregate many lap-level events.
 MATCH (driver_a:Driver)-[lap_a:RECORDED_LAP]->(lap:RaceLap)<-[lap_b:RECORDED_LAP]-(driver_b:Driver)
 WHERE driver_b.driver_id > driver_a.driver_id
   AND abs(lap_a.milliseconds - lap_b.milliseconds) <= 500
@@ -193,7 +183,6 @@ LIMIT 100;
 
 // Query Q5_GRAPH_TEAMMATE_SHORTEST_PATH
 // Objective: find the shortest teammate chain connecting Juan Manuel Fangio to Lando Norris, returning the full driver sequence where each hop means the two adjacent drivers were teammates in at least one race.
-// Expected profile: strongly favorable to Neo4j because TEAMMATE_WITH is a materialized graph relationship and shortestPath can traverse adjacency directly.
 MATCH (fangio:Driver {forename: 'Juan', surname: 'Fangio'})
 MATCH (norris:Driver {forename: 'Lando', surname: 'Norris'})
 MATCH path = shortestPath((fangio)-[:TEAMMATE_WITH*..8]-(norris))
@@ -205,7 +194,6 @@ RETURN
 
 // Query Q6_GRAPH_TEAMMATE_NEIGHBORHOOD_REACH
 // Objective: starting from Fernando Alonso, compute the shortest teammate-network distance to every distinct driver reachable within eight hops, producing a neighborhood distance map instead of a single target path.
-// Expected profile: favorable to Neo4j because shortest path expansion to many targets runs over native adjacency, while PostgreSQL must recursively expand simple paths and deduplicate distances.
 MATCH (start:Driver {driver_ref: 'alonso'})
 MATCH (other:Driver)
 WHERE other.driver_id <> start.driver_id
@@ -233,7 +221,6 @@ RETURN
 
 // Query Q7_GRAPH_CONSTRUCTOR_DRIVER_BRIDGE
 // Objective: find the shortest constructor-driver bridge connecting Christensen to Manor Marussia, two constructors without a direct shared-driver bridge, so the result must traverse several alternating constructor and driver steps across eras.
-// Expected profile: favorable to Neo4j because this is a bipartite path traversal over materialized DROVE_FOR relationships.
 MATCH (start:Constructor {constructor_ref: 'vhristensen'})
 MATCH (target:Constructor {constructor_ref: 'manor'})
 MATCH path = shortestPath((start)-[:DROVE_FOR*..10]-(target))
