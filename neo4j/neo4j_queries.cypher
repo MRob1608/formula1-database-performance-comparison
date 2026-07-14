@@ -1,6 +1,6 @@
 
-// Query Q1_REL_YEARLY_WINNERS
-// Objective: retrieve every race winner in Formula 1 history, enrich each win with lap-time pace context from the largest table, and keep cumulative career win counters for both the driver and constructor.
+// Query Q1_REL_RACE_WINNERS_WITH_LAP_CONTEXT
+// Objective: retrieve every race winner and, where lap-time data are available, enrich each win with race-pace context and cumulative career win counters for both the driver and constructor.
 MATCH (driver:Driver)-[result:RESULT]->(race:Race)
 MATCH (driver)-[drive:DROVE_FOR]->(constructor:Constructor)
 WHERE result.position_order = 1
@@ -56,7 +56,7 @@ RETURN
     size(constructor_wins_to_date) AS constructor_career_win_number
 ORDER BY year DESC, round DESC;
 
-// Query Q2_REL_CONSTRUCTOR_POINTS_BY_SEASON
+// Query Q2_REL_CUMULATIVE_CONSTRUCTOR_POINTS
 // Objective: rebuild the constructor standings after every championship round by combining race and sprint points, calculating each constructor's running season total, and ranking teams at each round.
 CALL {
     MATCH (driver:Driver)-[result:RESULT]->(race:Race)
@@ -157,8 +157,8 @@ RETURN
     slowest_lap_ms
 ORDER BY year DESC, avg_lap_ms ASC;
 
-// Query Q4_MIXED_LAP_BATTLE_AGGREGATION
-// Objective: find driver pairs who were closely matched on the same laps of the same race.
+// Query Q4_MIXED_SIMILAR_LAP_PACE_PAIRS
+// Objective: find driver pairs with similar lap times on the same laps of the same race, highlighting repeated closely matched pace patterns.
 MATCH (driver_a:Driver)-[lap_a:RECORDED_LAP]->(lap:RaceLap)<-[lap_b:RECORDED_LAP]-(driver_b:Driver)
 WHERE driver_b.driver_id > driver_a.driver_id
   AND abs(lap_a.milliseconds - lap_b.milliseconds) <= 500

@@ -1,6 +1,6 @@
 
--- Query Q1_REL_YEARLY_WINNERS
--- Objective: retrieve every race winner in Formula 1 history, enrich each win with lap-time pace context from the largest table, and keep cumulative career win counters for both the driver and constructor.
+-- Query Q1_REL_RACE_WINNERS_WITH_LAP_CONTEXT
+-- Objective: retrieve every race winner and, where lap-time data are available, enrich each win with race-pace context and cumulative career win counters for both the driver and constructor.
 WITH winners AS (
     SELECT
         r.race_id,
@@ -58,7 +58,7 @@ JOIN lap_context ON lap_context.race_id = winners.race_id
                 AND lap_context.driver_id = winners.driver_id
 ORDER BY winners.year DESC, winners.round DESC;
 
--- Query Q2_REL_CONSTRUCTOR_POINTS_BY_SEASON
+-- Query Q2_REL_CUMULATIVE_CONSTRUCTOR_POINTS
 -- Objective: rebuild the constructor standings after every championship round by combining race and sprint points, calculating each constructor's running season total, and ranking teams at each round.
 WITH scoring_events AS (
     SELECT
@@ -146,8 +146,8 @@ JOIN drivers AS d ON d.driver_id = lt.driver_id
 GROUP BY r.year, d.driver_id, d.forename, d.surname
 ORDER BY r.year DESC, avg_lap_ms ASC;
 
--- Query Q4_MIXED_LAP_BATTLE_AGGREGATION
--- Objective: find driver pairs who were closely matched on the same laps of the same race.
+-- Query Q4_MIXED_SIMILAR_LAP_PACE_PAIRS
+-- Objective: find driver pairs with similar lap times on the same laps of the same race, highlighting repeated closely matched pace patterns.
 WITH close_lap_pairs AS (
     SELECT
         r.year,
