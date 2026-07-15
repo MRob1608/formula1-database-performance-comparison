@@ -2,6 +2,14 @@
 
 This project compares PostgreSQL and Neo4j using the same Formula 1 dataset. The goal is to observe how a relational database and a graph database perform with different types of queries, including aggregations, lap-time comparisons and graph traversals.
 
+## Dataset
+
+Download the [Formula 1 World Championship dataset](https://www.kaggle.com/datasets/rohanrao/formula-1-world-championship-1950-2020), place its CSV files inside `data/raw/`, then generate the cleaned files with:
+
+```bash
+python src/data_cleaning.py
+```
+
 ## Setup
 
 Create a virtual environment, activate it and install the dependencies:
@@ -9,12 +17,6 @@ Create a virtual environment, activate it and install the dependencies:
 ```bash
 python -m venv venv
 pip install -r requirements.txt
-```
-
-The scripts expect the processed CSV files inside `data/processed/`. If the original files are in `data/raw/`, they can be cleaned with:
-
-```bash
-python src/data_cleaning.py
 ```
 
 ## Running The Databases
@@ -132,4 +134,3 @@ The last three queries are all based on shortest paths, but they produce very di
 | `Q5_GRAPH_TEAMMATE_SHORTEST_PATH` | >600 | timeout | 0.113772 | 1 |
 | `Q6_GRAPH_TEAMMATE_NEIGHBORHOOD_REACH` | 12.620290 | 1 | 0.263846 | 1 |
 | `Q7_GRAPH_CONSTRUCTOR_DRIVER_BRIDGE` | 110.729184 | 1 | 0.062907 | 1 |
-
